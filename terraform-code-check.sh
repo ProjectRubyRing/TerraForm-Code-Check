@@ -138,7 +138,9 @@ Terraform 実行オプション:
                           自動スイッチバック時に source する専用シェルのパス
                           （別チーム提供。環境変数 SWITCH_BACK_SCRIPT でも指定可）
   --probe-command <cmd>   AWS 操作権限の有無を判定するコマンド（成功=権限あり）。
-                          既定: aws ec2 describe-regions
+                          既定: aws ec2 describe-regions（リージョンは --region /
+                          AWS_REGION / AWS_DEFAULT_REGION の順に解決し、無ければ
+                          us-east-1 を補って判定する）。
                           例  : --probe-command "aws s3api head-bucket --bucket my-tfstate"
   --no-aws-check          AWS 認証/権限チェックを行わない（backend がローカルの場合など）
 
@@ -240,7 +242,11 @@ probe_aws_permission() {
     log_debug "権限判定コマンド: ${PROBE_COMMAND}"
     bash -c "${PROBE_COMMAND}" >/dev/null 2>&1
   else
-    aws ec2 describe-regions --output text >/dev/null 2>&1
+    # EC2 はリージョナル API のため、リージョン未解決だと「権限」とは無関係に
+    # 失敗する（"You must specify a region" 等）。--region 未指定でも判定が
+    # フォールスネガティブにならないよう、判定用のリージョンを補って実行する。
+    local probe_region="${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
+    aws ec2 describe-regions --region "${probe_region}" --output text >/dev/null 2>&1
   fi
 }
 
