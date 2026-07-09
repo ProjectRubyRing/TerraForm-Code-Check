@@ -201,17 +201,22 @@ ensure_permission_or_switch() {
   fi
 
   # ここに来たら「source は成功したのに権限判定だけ失敗」の状態。
-  # 判定コマンドのフォールスネガティブ（無関係な権限やリージョン未解決、
-  # 資格情報の export 漏れ等）が多いので、原因切り分け用の情報を提示する。
+  # 原因切り分け用の情報を提示する。
   log_error "${switch_name}を実行しましたが、${label} への操作権限を獲得できませんでした。"
-  log_error "  ${switch_name}自体（source）は成功しています。権限「判定コマンド」が失敗しています。"
+  log_error "  ${switch_name}自体（source）は成功しています。権限「判定」が失敗しています。"
   log_error "  次の点を確認してください:"
-  log_error "    1) リージョン: 既定判定は ec2:DescribeRegions を使うためリージョン解決が必要です。"
-  log_error "                   --region <region>（例: ap-northeast-1）を指定してください。"
-  log_error "    2) 判定内容 : 判定コマンドが切替先ロールの権限に合っているか。"
-  log_error "                   合わない場合は --probe-command '<成功=権限ありとなるコマンド>' で差し替えてください。"
+  log_error "    1) 判定内容 : 既定判定は terraform init の成否で行います。init が backend"
+  log_error "                   初期化以外（backend 設定不整合・provider 取得失敗等）で失敗している"
+  log_error "                   可能性があります。判定ログ（下記）の Error 行を確認してください。"
+  if [[ -n "${PROBE_INIT_LOG:-}" && -f "${PROBE_INIT_LOG:-}" ]]; then
+    log_error "                   判定 init ログ: ${PROBE_INIT_LOG}"
+    grep -E "Error|error|Denied|AccessDenied" "${PROBE_INIT_LOG}" 2>/dev/null \
+      | head -n 8 | sed 's/^/                     /' >&2 || true
+  fi
+  log_error "    2) 判定方式 : terraform を使わず特定 API で判定したい場合は"
+  log_error "                   --probe-command '<成功=権限ありとなるコマンド>' で差し替えられます。"
   log_error "    3) 資格情報 : ${switch_name}用シェルが AWS 資格情報を export しているか"
-  log_error "                   （export されていないシェル変数は aws コマンドに引き継がれません）。"
+  log_error "                   （export されていないシェル変数は aws/terraform に引き継がれません）。"
   if command -v aws >/dev/null 2>&1; then
     local cur_arn
     cur_arn="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || echo '(取得失敗: 未認証の可能性)')"
