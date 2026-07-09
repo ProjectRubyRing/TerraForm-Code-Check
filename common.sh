@@ -199,5 +199,23 @@ ensure_permission_or_switch() {
     log_success "${switch_name}後、${label} への操作権限を確認しました。"
     return 0
   fi
-  die "${switch_name}を実行しましたが、${label} への操作権限を獲得できませんでした。"
+
+  # ここに来たら「source は成功したのに権限判定だけ失敗」の状態。
+  # 判定コマンドのフォールスネガティブ（無関係な権限やリージョン未解決、
+  # 資格情報の export 漏れ等）が多いので、原因切り分け用の情報を提示する。
+  log_error "${switch_name}を実行しましたが、${label} への操作権限を獲得できませんでした。"
+  log_error "  ${switch_name}自体（source）は成功しています。権限「判定コマンド」が失敗しています。"
+  log_error "  次の点を確認してください:"
+  log_error "    1) リージョン: 既定判定は ec2:DescribeRegions を使うためリージョン解決が必要です。"
+  log_error "                   --region <region>（例: ap-northeast-1）を指定してください。"
+  log_error "    2) 判定内容 : 判定コマンドが切替先ロールの権限に合っているか。"
+  log_error "                   合わない場合は --probe-command '<成功=権限ありとなるコマンド>' で差し替えてください。"
+  log_error "    3) 資格情報 : ${switch_name}用シェルが AWS 資格情報を export しているか"
+  log_error "                   （export されていないシェル変数は aws コマンドに引き継がれません）。"
+  if command -v aws >/dev/null 2>&1; then
+    local cur_arn
+    cur_arn="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || echo '(取得失敗: 未認証の可能性)')"
+    log_error "  現在の認証 ARN: ${cur_arn}"
+  fi
+  exit 1
 }
