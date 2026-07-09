@@ -84,7 +84,7 @@ NO_AWS_CHECK="false"        # true なら AWS 認証/権限チェックを行わ
 AUTO_SWITCH_BACK="false"
 # 別チーム提供の「スイッチバック用シェル」のパス（source で呼び出す）。環境変数でも指定可
 SWITCH_BACK_SCRIPT="${SWITCH_BACK_SCRIPT:-}"
-# AWS 操作権限の有無を判定するコマンド（既定: aws ec2 describe-regions）。環境変数でも指定可
+# AWS 操作権限の有無を判定するコマンド（既定: terraform init の成否で判定）。環境変数でも指定可
 PROBE_COMMAND="${PROBE_COMMAND:-}"
 
 DEBUG="${DEBUG:-false}"
@@ -93,6 +93,10 @@ export DEBUG
 # --- 実行結果の状態（サマリ/終了コード用） ---
 OVERALL_RC=0                # 0=正常, 2=init/validate/plan にエラーあり
 INIT_RC=0
+# 権限判定で terraform init を実行済みかどうか（run_init での二重実行回避に使う）
+PROBE_INIT_DONE="false"
+PROBE_INIT_RC=0
+PROBE_INIT_LOG=""
 FMT_NEEDED=0                # 整形が必要なファイル数
 VALIDATE_ERRORS=0
 VALIDATE_WARNINGS=0
@@ -138,9 +142,10 @@ Terraform 実行オプション:
                           自動スイッチバック時に source する専用シェルのパス
                           （別チーム提供。環境変数 SWITCH_BACK_SCRIPT でも指定可）
   --probe-command <cmd>   AWS 操作権限の有無を判定するコマンド（成功=権限あり）。
-                          既定: aws ec2 describe-regions（リージョンは --region /
-                          AWS_REGION / AWS_DEFAULT_REGION の順に解決し、無ければ
-                          us-east-1 を補って判定する）。
+                          既定は特定 API に依存せず「terraform init が通るか」で判定
+                          します（backend 初期化に必要な権限をそのままテスト。判定時の
+                          init 結果は本実行の init に再利用します）。特定 API で判定
+                          したい場合のみ本オプションで差し替えてください。
                           例  : --probe-command "aws s3api head-bucket --bucket my-tfstate"
   --no-aws-check          AWS 認証/権限チェックを行わない（backend がローカルの場合など）
 
@@ -233,21 +238,45 @@ validate_inputs() {
 
 # ---------------------------------------------------------------------------
 # 4b. AWS 操作権限の判定（ensure_permission_or_switch から呼ばれる）
-#     既定は ec2:DescribeRegions（ほぼ全リソース操作系ロールで許可される読み取り API）。
-#     CodeCommit 専用ロールへスイッチしたままの場合はここで失敗する想定。
-#     backend や plan 対象に合わせて --probe-command で差し替え可能。
+#     既定判定は「実際に terraform init が通るか」で行う（= backend 初期化に
+#     必要な AWS 権限があるか）。特定の AWS API（ec2:DescribeRegions 等）に
+#     依存すると、その権限を持たない運用ロールでフォールスネガティブになるため、
+#     tool が実際に必要とする操作そのものをテストする。
+#     （本判定が呼ばれるのは AWS 接続が必要なとき＝ --skip-plan/--no-aws-check
+#       でないときのみ。よって backend 初期化ありの init で判定する。）
+#     --probe-command 指定時はそのコマンド（成功=権限あり）で判定する。
 # ---------------------------------------------------------------------------
 probe_aws_permission() {
   if [[ -n "${PROBE_COMMAND}" ]]; then
     log_debug "権限判定コマンド: ${PROBE_COMMAND}"
     bash -c "${PROBE_COMMAND}" >/dev/null 2>&1
-  else
-    # EC2 はリージョナル API のため、リージョン未解決だと「権限」とは無関係に
-    # 失敗する（"You must specify a region" 等）。--region 未指定でも判定が
-    # フォールスネガティブにならないよう、判定用のリージョンを補って実行する。
-    local probe_region="${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
-    aws ec2 describe-regions --region "${probe_region}" --output text >/dev/null 2>&1
+    return
   fi
+
+  # 既定判定: terraform init を実行して成否を見る。
+  # 判定結果（ログと終了コード）は run_init で再利用し、二重実行を避ける。
+  local init_args=(init -input=false -no-color)
+  [[ "${UPGRADE}" == "true" ]] && init_args+=(-upgrade)
+  local bc
+  for bc in "${BACKEND_CONFIGS[@]:-}"; do
+    [[ -n "${bc}" ]] && init_args+=(-backend-config="${bc}")
+  done
+
+  # ログの置き場所（WORKDIR はまだ無いので専用の一時ファイルを使い回す）
+  if [[ -z "${PROBE_INIT_LOG}" ]]; then
+    PROBE_INIT_LOG="$(mktemp "${TMPDIR:-/tmp}/tfcheck-probe-init.XXXXXX.log")" \
+      || { log_warn "権限判定用の一時ログを作成できませんでした。"; return 1; }
+  fi
+
+  log_debug "権限判定: terraform -chdir=${ROOT_DIR} ${init_args[*]}"
+  local rc=0
+  terraform -chdir="${ROOT_DIR}" "${init_args[@]}" > "${PROBE_INIT_LOG}" 2>&1 || rc=$?
+  PROBE_INIT_RC="${rc}"
+  PROBE_INIT_DONE="true"
+  if [[ "${rc}" -ne 0 ]]; then
+    log_debug "権限判定の terraform init が失敗しました（rc=${rc}）。ログ: ${PROBE_INIT_LOG}"
+  fi
+  return "${rc}"
 }
 
 # ---------------------------------------------------------------------------
@@ -560,18 +589,32 @@ analyze_tf_error_log() {
 run_init() {
   section "[1/8] terraform init"
 
-  local init_args=(init -input=false -no-color)
-  [[ "${SKIP_PLAN}" == "true" ]] && init_args+=(-backend=false)
-  [[ "${UPGRADE}" == "true" ]]   && init_args+=(-upgrade)
-  local bc
-  for bc in "${BACKEND_CONFIGS[@]:-}"; do
-    [[ -n "${bc}" ]] && init_args+=(-backend-config="${bc}")
-  done
-
   local log="${WORKDIR}/init.log"
-  log_info "実行: terraform -chdir=${ROOT_DIR} ${init_args[*]}"
-  INIT_RC=0
-  terraform -chdir="${ROOT_DIR}" "${init_args[@]}" > "${log}" 2>&1 || INIT_RC=$?
+
+  # 権限判定（既定判定）の段階で terraform init を実行済みなら、その結果を再利用し
+  # 二重実行を避ける。--probe-command 使用時や --skip-plan/--no-aws-check 時は
+  # 未実行なので通常実行する。
+  if [[ "${PROBE_INIT_DONE}" == "true" ]]; then
+    log_info "権限判定時に実行した terraform init の結果を再利用します。"
+    if [[ -n "${PROBE_INIT_LOG}" && -f "${PROBE_INIT_LOG}" ]]; then
+      cp -f "${PROBE_INIT_LOG}" "${log}" 2>/dev/null || : > "${log}"
+      rm -f "${PROBE_INIT_LOG}"
+    else
+      : > "${log}"
+    fi
+    INIT_RC="${PROBE_INIT_RC}"
+  else
+    local init_args=(init -input=false -no-color)
+    [[ "${SKIP_PLAN}" == "true" ]] && init_args+=(-backend=false)
+    [[ "${UPGRADE}" == "true" ]]   && init_args+=(-upgrade)
+    local bc
+    for bc in "${BACKEND_CONFIGS[@]:-}"; do
+      [[ -n "${bc}" ]] && init_args+=(-backend-config="${bc}")
+    done
+    log_info "実行: terraform -chdir=${ROOT_DIR} ${init_args[*]}"
+    INIT_RC=0
+    terraform -chdir="${ROOT_DIR}" "${init_args[@]}" > "${log}" 2>&1 || INIT_RC=$?
+  fi
 
   if [[ "${INIT_RC}" -eq 0 ]]; then
     log_success "init 成功。プロバイダ・モジュールの取得と backend 初期化が完了しました。"
