@@ -93,6 +93,55 @@ XLSX_FILE=""
 HTML_FILE=""
 
 # ---------------------------------------------------------------------------
+# 1b. 予期しないエラーのハンドリング
+#     本スクリプトは `set -Eeuo pipefail` で動作するため、想定外の非 0 終了が
+#     起きると「画面に何も出さないまま」停止し、レポートも出力されない。
+#     ERR トラップで「どこで・何が・どの終了コードで」失敗したかを必ず表示し、
+#     可能であれば中断時点までの分析結果でレポートを出力する。
+# ---------------------------------------------------------------------------
+FATAL_HANDLED="false"       # ERR トラップの多重実行防止
+REPORTS_STARTED="false"     # build_reports に入ったか
+REPORTS_DONE="false"        # レポート出力が完了したか
+
+# 中断時に「途中結果レポート」を出せる状態かどうか
+can_emit_partial_reports() {
+  [[ "${REPORTS_STARTED}" == "true" ]] && return 1
+  [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]] || return 1
+  [[ -n "${XLSX_FILE}" && -n "${HTML_FILE}" ]] || return 1
+  [[ -n "${SUMMARY_TSV:-}" && -f "${SUMMARY_TSV}" ]] || return 1
+  declare -F build_reports >/dev/null 2>&1 || return 1
+  return 0
+}
+
+on_unexpected_error() {
+  local rc="${1:-1}" line="${2:-?}" cmd="${3:-?}"
+  trap - ERR
+  set +e
+  if [[ "${FATAL_HANDLED}" == "true" ]]; then
+    exit 1
+  fi
+  FATAL_HANDLED="true"
+
+  log_error "予期しないエラーが発生したため、処理を中断します。"
+  log_error "  発生箇所   : ${SCRIPT_NAME}:${line}"
+  log_error "  コマンド   : ${cmd}"
+  log_error "  終了コード : ${rc}"
+  if [[ -n "${WORKDIR}" ]]; then
+    log_error "  作業ディレクトリ（ログ/中間ファイル）: ${WORKDIR}"
+  fi
+
+  # 出力先ディレクトリが空のままにならないよう、途中経過だけでもレポートを残す。
+  if can_emit_partial_reports; then
+    log_warn "中断時点までの分析結果でレポートを出力します（内容は不完全です）。"
+    OVERALL_RC=2
+    add_summary "スクリプト実行" "中断（予期しないエラー）" "${SCRIPT_NAME}:${line} で失敗（rc=${rc}）: ${cmd}"
+    build_reports || log_error "レポートの出力にも失敗しました。"
+  fi
+  exit 1
+}
+trap 'on_unexpected_error "$?" "${LINENO}" "${BASH_COMMAND}"' ERR
+
+# ---------------------------------------------------------------------------
 # 2. 使い方
 # ---------------------------------------------------------------------------
 usage() {
@@ -699,7 +748,7 @@ extract_changes_from_json() {
     | ($rc.change.before // {}) as $b
     | ($rc.change.after  // {}) as $a
     | ($rc.change.after_unknown // {}) as $u
-    | ( [$b, $a] | add | keys_unstable | unique ) as $ks
+    | ( [$b, $a] | add | keys_unsorted | unique ) as $ks
     | $ks[] | . as $k
     | ($b[$k]) as $bv | ($a[$k]) as $av | ($u[$k]) as $uv
     | select( ($uv == true) or ($bv != $av) )
@@ -828,6 +877,13 @@ risk_for_change() {
     aws_autoscaling_group)
       [[ "${is_delete}" == "true" ]] && add_risk "中" "${addr}" "${action}" "インスタンスの終了待ちで削除に時間がかかる/タイムアウトし得る" "force_delete や timeouts の設定を確認" ;;
   esac
+
+  # 重要: 上の case 分岐は末尾が `[[ 条件 ]] && add_risk ...` の形なので、
+  # 条件が偽のときは case 全体（= この関数）が「非 0」で戻る。
+  # 呼び出し元は set -e 配下のため、それだけでスクリプトが
+  # （エラーも出さずに）中断してしまう。
+  # ここは「該当リスク無し」を意味する正常系なので、必ず 0 を返す。
+  return 0
 }
 
 analyze_apply_risks() {
@@ -1394,6 +1450,7 @@ FOOT
 # 14. レポート生成の親関数
 # ---------------------------------------------------------------------------
 build_reports() {
+  REPORTS_STARTED="true"
   section "レポート出力（Excel / HTML）"
 
   # メタ情報
@@ -1417,6 +1474,7 @@ build_reports() {
 
   generate_xlsx
   generate_html
+  REPORTS_DONE="true"
 }
 
 # ---------------------------------------------------------------------------
